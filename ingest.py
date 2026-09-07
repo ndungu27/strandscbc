@@ -43,6 +43,7 @@ import json
 import os
 import re
 import sys
+import time
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -323,7 +324,7 @@ def main():
         embedding_function=gemini_ef,
     )
 
-    batch_size = 50
+    batch_size = 20
     for i in range(0, len(all_chunks), batch_size):
         batch = all_chunks[i:i + batch_size]
         collection.upsert(
@@ -332,6 +333,8 @@ def main():
             metadatas=[c["metadata"] for c in batch],
         )
         print(f"  Upserted {i + len(batch)}/{len(all_chunks)}")
+
+        time.sleep(15)
 
     print(f"\nDone. Collection '{COLLECTION_NAME}' now has {collection.count()} chunk(s) "
           f"stored at {CHROMA_DB_PATH}")

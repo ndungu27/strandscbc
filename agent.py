@@ -1,195 +1,146 @@
-"""
-KICD Curriculum Agent
-======================
-Given a teacher's request like "Grade 4, Agriculture, Conserving Water",
-this agent:
-  1. Retrieves the official KICD sub-strand content from ChromaDB
-     (grounded -- never invents outcomes/PCIs)
-  2. Drafts a Scheme of Work, Lesson Plan, and Assessment Rubric using
-     Gemini via the Strands SDK, constrained to the Pydantic schemas
-     in models.py
-
-Usage:
-    export GEMINI_API_KEY=your_key_here
-    python agent.py "Grade 4, Agriculture, Conserving Water"
-"""
-
 import os
-import sys
-
 import chromadb
-from gemini_embedding import GeminiEmbeddingFunction
-from strands import Agent, tool
-from strands.models.gemini import GeminiModel
+from google import genai
+from google.genai import types
 from dotenv import load_dotenv
+
+from gemini_embedding import GeminiEmbeddingFunction
+from models import LessonPlan, SchemeOfWork
+from doc_generator import create_lesson_plan_docx, create_scheme_of_work_docx
+
+# 1. Load environment variables
 load_dotenv()
+api_key = os.environ.get("GEMINI_API_KEY")
+if not api_key:
+    raise ValueError("GEMINI_API_KEY is missing. Check your .env file.")
 
-from models import LessonPlan, SchemeOfWork, AssessmentRubric
+# 2. Initialize Gemini Client
+ai_client = genai.Client(api_key=api_key)
 
-CHROMA_DB_PATH = "./kicd_chroma_db"
+# 3. Connect to the Chroma Vector Database
+CHROMA_DB_PATH = "kicd_chroma_db"
 COLLECTION_NAME = "kicd_curriculum"
 
-API_KEY = os.environ.get("GEMINI_API_KEY")
-if not API_KEY:
-    print("Set the GEMINI_API_KEY environment variable first.")
-    sys.exit(1)
-
-# --- ChromaDB setup -------------------------------------------------------
-
-client = chromadb.PersistentClient(path=CHROMA_DB_PATH)
+db_client = chromadb.PersistentClient(path=CHROMA_DB_PATH)
 gemini_ef = GeminiEmbeddingFunction(api_key=api_key)
-collection = client.get_or_create_collection(
-        name=COLLECTION_NAME,
-        embedding_function=gemini_ef,
+collection = db_client.get_collection(
+    name=COLLECTION_NAME,
+    embedding_function=gemini_ef,
+)
+
+def retrieve_context(query: str, n_results: int = 5) -> str:
+    """Searches the vector database for the most relevant curriculum chunks."""
+    results = collection.query(
+        query_texts=[query],
+        n_results=n_results
     )
+    
+    # Combine the found texts into a single context string
+    if not results["documents"] or not results["documents"][0]:
+        return "No relevant KICD curriculum context found."
+        
+    context_chunks = results["documents"][0]
+    return "\n\n---\n\n".join(context_chunks)
 
-# --- Tools ------------------------------------------------------------------
-
-@tool
-def retrieve_kicd_content(grade: str, subject: str, topic: str) -> str:
-    """Retrieve the official KICD strand, sub-strand, learning outcomes,
-    suggested learning experiences, key inquiry question(s), core
-    competencies, and Pertinent and Contemporary Issues (PCIs) for a given
-    grade, subject, and topic from the curriculum design database.
-
-    Always call this BEFORE drafting a scheme of work, lesson plan, or
-    rubric. Do not draft anything using content that was not returned by
-    this tool -- if it returns no results, tell the user rather than
-    inventing curriculum content.
-
-    Args:
-        grade: e.g. "Grade 4"
-        subject: e.g. "Agriculture"
-        topic: the sub-strand topic, e.g. "Conserving Water"
+def generate_lesson_plan(prompt: str) -> LessonPlan:
+    """Generates a Lesson Plan using retrieved context and Structured Outputs."""
+    print(f"\n Searching curriculum database for: '{prompt}'...")
+    context = retrieve_context(prompt, n_results=4)
+    
+    print(" Thinking and structuring the Lesson Plan...")
+    
+    system_instruction = f"""You are an expert Kenyan CBC curriculum developer and teacher.
+    Use the provided KICD curriculum context to generate a detailed, highly accurate Lesson Plan.
+    Do NOT invent specific learning outcomes, experiences, or rubrics if they contradict the provided context.
+    Fill out every field in the required schema thoughtfully.
+    
+    KICD CONTEXT:
+    {context}
     """
-    results = _collection.query(
-        query_texts=[topic],
-        n_results=3,
-        where={"$and": [{"grade": grade}, {"subject": subject}]},
-    )
-    documents = results.get("documents", [[]])[0]
-    if not documents:
-        return (
-            f"NO KICD CONTENT FOUND for grade='{grade}', subject='{subject}', "
-            f"topic='{topic}'. Do not fabricate outcomes or PCIs. Tell the "
-            f"user to check the grade/subject/topic spelling, or that this "
-            f"curriculum design has not been ingested yet."
-        )
-    return "\n\n---\n\n".join(documents)
-
-
-# --- Agent setup --------------------------------------------------------
-
-_model = GeminiModel(
-    client_args={"api_key": API_KEY},
-    model_id="gemini-3.1-flash-lite",
-    params={"temperature": 0.3, "max_output_tokens": 4096},
-)
-
-SYSTEM_PROMPT = """You are a curriculum planning assistant for Kenyan CBC
-(Competency-Based Curriculum) teachers, built on official KICD curriculum
-designs.
-
-Rules you must always follow:
-1. Before drafting anything, call retrieve_kicd_content with the grade,
-   subject, and topic the teacher gave you.
-2. Base every specific learning outcome, key inquiry question, core
-   competency, value, and PCI ONLY on what retrieve_kicd_content returns.
-   Never invent or assume curriculum content that wasn't retrieved.
-3. If retrieval finds nothing, say so plainly and ask the teacher to check
-   the grade/subject/topic -- do not draft a plan anyway.
-4. Keep language practical and classroom-ready; a teacher should be able to
-   use your output with little to no editing.
-5. Make sure PCIs are woven meaningfully into learning experiences, not just
-   listed as a label.
-"""
-
-agent = Agent(
-    model=_model,
-    tools=[retrieve_kicd_content],
-    system_prompt=SYSTEM_PROMPT,
-)
-
-
-# --- Grounding check -----------------------------------------------------
-
-def grounding_check(generated_text: str, retrieved_text: str, min_overlap: float = 0.15) -> bool:
-    """Cheap anti-hallucination signal: what fraction of distinctive words
-    in the retrieved KICD content also appear in the generated output.
-    Not a rigorous metric -- just a fast sanity check to flag drift for
-    manual review, e.g. in a hackathon demo."""
-    def words(t: str) -> set:
-        return {w.lower() for w in t.split() if len(w) > 5}
-
-    retrieved_words = words(retrieved_text)
-    generated_words = words(generated_text)
-    if not retrieved_words:
-        return True
-    overlap = len(retrieved_words & generated_words) / len(retrieved_words)
-    return overlap >= min_overlap
-
-
-# --- Main entry point -----------------------------------------------------
-
-def plan_lesson(grade: str, subject: str, topic: str):
-    """Runs the full pipeline: retrieve -> draft scheme of work, lesson
-    plan, and rubric as validated structured objects."""
-
-    retrieved = retrieve_kicd_content(grade=grade, subject=subject, topic=topic)
-    if retrieved.startswith("NO KICD CONTENT FOUND"):
-        print(retrieved)
-        return None
-
-    print("--- Retrieved KICD content ---")
-    print(retrieved[:600], "...\n")
-
-    base_prompt = (
-        f"Using ONLY this official KICD content:\n\n{retrieved}\n\n"
-        f"Draft a {{artifact}} for {grade} {subject}, topic '{topic}'."
-    )
-
-    lesson_plan = agent.structured_output(
-        LessonPlan, prompt=base_prompt.format(artifact="single lesson plan")
-    )
-    scheme_of_work = agent.structured_output(
-        SchemeOfWork,
-        prompt=base_prompt.format(
-            artifact="4-lesson scheme of work covering this sub-strand across a term"
+    
+    
+    # We manually define the schema dictionary to match YOUR models.py exactly
+    manual_schema = {
+        "type": "OBJECT",
+        "properties": {
+            "grade": {"type": "STRING"},
+            "subject": {"type": "STRING"},
+            "strand": {"type": "STRING"},
+            "sub_strand": {"type": "STRING"},
+            "week": {"type": "INTEGER", "description": "Week number within the term/scheme"},
+            "lesson_number": {"type": "INTEGER", "description": "Lesson number within the week"},
+            "specific_learning_outcomes": {
+                "type": "ARRAY", 
+                "items": {"type": "STRING"},
+                "description": "Verbatim or lightly adapted from the KICD sub-strand outcomes"
+            },
+            "key_inquiry_question": {"type": "STRING"},
+            "core_competencies": {"type": "ARRAY", "items": {"type": "STRING"}},
+            "pcis": {
+                "type": "ARRAY", 
+                "items": {"type": "STRING"},
+                "description": "Pertinent and Contemporary Issues addressed"
+            },
+            "values": {"type": "ARRAY", "items": {"type": "STRING"}},
+            "organisation_of_learning": {
+                "type": "OBJECT",
+                "properties": {
+                    "introduction": {"type": "STRING"},
+                    "lesson_development": {"type": "STRING"},
+                    "conclusion": {"type": "STRING"}
+                },
+                "required": ["introduction", "lesson_development", "conclusion"]
+            },
+            "resources": {"type": "ARRAY", "items": {"type": "STRING"}},
+            "assessment_methods": {"type": "ARRAY", "items": {"type": "STRING"}},
+            "reflection": {"type": "STRING", "description": "Blank space/prompt for the teacher's post-lesson reflection"}
+        },
+        "required": [
+            "grade", "subject", "strand", "sub_strand", "week", "lesson_number",
+            "specific_learning_outcomes", "key_inquiry_question", "core_competencies",
+            "pcis", "values", "organisation_of_learning", "resources", "assessment_methods"
+        ]
+    }
+    
+    response = ai_client.models.generate_content(
+        model='gemini-3.1-flash-lite',
+        contents=prompt,
+        config=types.GenerateContentConfig(
+            system_instruction=system_instruction,
+            response_mime_type="application/json",
+            response_schema=manual_schema, 
+            temperature=0.2, 
         ),
     )
-    rubric = agent.structured_output(
-        AssessmentRubric, prompt=base_prompt.format(artifact="assessment rubric")
-    )
-
-    is_grounded = grounding_check(lesson_plan.model_dump_json(), retrieved)
-    print(f"Grounding check on lesson plan: {'PASS' if is_grounded else 'REVIEW NEEDED'}\n")
-
-    return {
-        "lesson_plan": lesson_plan,
-        "scheme_of_work": scheme_of_work,
-        "rubric": rubric,
-        "grounded": is_grounded,
-    }
-
-
+    
+    # We parse the pure JSON text response back into our Pydantic object
+    return LessonPlan.model_validate_json(response.text)
+    
+    
 if __name__ == "__main__":
-    if len(sys.argv) < 2:
-        print('Usage: python agent.py "Grade 4, Agriculture, Conserving Water"')
-        sys.exit(1)
-
-    raw = sys.argv[1]
-    parts = [p.strip() for p in raw.split(",")]
-    if len(parts) != 3:
-        print('Please format as: "Grade, Subject, Topic" e.g. "Grade 4, Agriculture, Conserving Water"')
-        sys.exit(1)
-
-    grade_in, subject_in, topic_in = parts
-    result = plan_lesson(grade_in, subject_in, topic_in)
-
-    if result:
-        print("=== LESSON PLAN ===")
-        print(result["lesson_plan"].model_dump_json(indent=2))
-        print("\n=== SCHEME OF WORK ===")
-        print(result["scheme_of_work"].model_dump_json(indent=2))
-        print("\n=== RUBRIC ===")
-        print(result["rubric"].model_dump_json(indent=2))
+    print(" CBC Agent is ready!")
+    print("Type 'exit' to quit.\n")
+    
+    while True:
+        user_prompt = input("What would you like to create? (e.g., 'Make a lesson plan for Grade 4 Agriculture on conserving water'):\n> ")
+        
+        if user_prompt.lower() in ['exit', 'quit']:
+            break
+            
+        if not user_prompt.strip():
+            continue
+            
+        try:
+            # 1. Generate the object
+            lesson_plan_obj = generate_lesson_plan(user_prompt)
+            
+            # 2. Sanitize filename (remove spaces/special chars)
+            safe_strand = "".join(c for c in lesson_plan_obj.sub_strand if c.isalnum() or c in (' ', '_')).rstrip()
+            filename = f"Lesson_Plan_{safe_strand.replace(' ', '_')}.docx"
+            
+            # 3. Create the Word Document
+            print(" Drawing the Word Document...")
+            create_lesson_plan_docx(lesson_plan_obj, output_path=filename)
+            
+        except Exception as e:
+            print(f" An error occurred: {e}")
